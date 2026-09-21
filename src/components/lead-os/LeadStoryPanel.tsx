@@ -111,8 +111,43 @@ export function LeadStoryPanel({
 
   const visible = showAll ? ordered : ordered.slice(-12);
 
+  // ── 1-Click Qualify helpers ────────────────────────────────────────────────
+  const qualifyPresets = [
+    {
+      label: "HSR · 15k · Immediate",
+      message: `Hi ${name || "there"}, confirming your qualification:\n• Area: HSR Layout\n• Budget: ₹15,000/mo\n• Move-in: Immediate\n\nWe'll share matching options shortly. 🏠`,
+    },
+    {
+      label: "BTM · 10k · Shared",
+      message: `Hi ${name || "there"}, confirming your qualification:\n• Area: BTM Layout\n• Budget: ₹10,000/mo\n• Move-in: Flexible (shared preferred)\n\nWe'll share matching options shortly. 🏠`,
+    },
+  ] as const;
+
   return (
     <div className="space-y-3">
+      {/* ── 1-Click Qualification Preset Bar ─────────────────────────── */}
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+        <span className="flex items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400 shrink-0">
+          <Sparkles className="h-4 w-4 text-amber-600" />
+          ⚡ 1-Click Qualify Presets:
+        </span>
+        {qualifyPresets.map((preset) => (
+          <Button
+            key={preset.label}
+            size="sm"
+            variant="outline"
+            className="h-7 border-amber-500/50 text-xs hover:bg-amber-500/10 hover:text-amber-700"
+            onClick={() => {
+              void navigator.clipboard.writeText(preset.message);
+              toast.success(`Qualified as "${preset.label}" — message copied to clipboard`);
+            }}
+          >
+            {preset.label}
+          </Button>
+        ))}
+      </div>
+      {/* ────────────────────────────────────────────────────────────── */}
+
       <Card className={`space-y-3 border-2 p-4 ${sla.tone === "danger" ? "border-red-500/60" : sla.tone === "warn" ? "border-amber-500/50" : "border-border"}`}>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
