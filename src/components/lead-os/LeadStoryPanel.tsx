@@ -123,24 +123,37 @@ export function LeadStoryPanel({
     },
   ] as const;
 
+  function handlePresetClick(
+    e: React.MouseEvent<HTMLButtonElement>,
+    preset: { label: string; message: string },
+  ) {
+    e.preventDefault();
+    e.stopPropagation();
+    console.log("Preset clicked:", preset);
+    void navigator.clipboard.writeText(preset.message);
+    toast.success(`Qualified as "${preset.label}" — message copied to clipboard`);
+  }
+
   return (
     <div className="space-y-3">
       {/* ── 1-Click Qualification Preset Bar ─────────────────────────── */}
-      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2">
-        <span className="flex items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400 shrink-0">
+      <div
+        className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2"
+        style={{ position: "relative", zIndex: 10, pointerEvents: "auto" }}
+      >
+        <span className="flex shrink-0 items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400">
           <Sparkles className="h-4 w-4 text-amber-600" />
           ⚡ 1-Click Qualify Presets:
         </span>
         {qualifyPresets.map((preset) => (
           <Button
             key={preset.label}
+            type="button"
             size="sm"
             variant="outline"
             className="h-7 border-amber-500/50 text-xs hover:bg-amber-500/10 hover:text-amber-700"
-            onClick={() => {
-              void navigator.clipboard.writeText(preset.message);
-              toast.success(`Qualified as "${preset.label}" — message copied to clipboard`);
-            }}
+            style={{ pointerEvents: "auto" }}
+            onClick={(e) => handlePresetClick(e, preset)}
           >
             {preset.label}
           </Button>
