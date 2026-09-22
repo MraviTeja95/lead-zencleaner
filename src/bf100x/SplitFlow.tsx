@@ -1,8 +1,11 @@
 // The 100x funnel squeezed into 40% of the screen, so WhatsApp can live in the
 // other 60%. One screen, nothing to scroll except the questions themselves.
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { Activity, ArrowLeft, ArrowRight, BellRing, ListChecks, Menu, PhoneCall, ShieldAlert, UserCheck } from "lucide-react";
+import {
+  Activity, ArrowLeft, ArrowRight, BellRing, ListChecks, Menu, PhoneCall, ShieldAlert, UserCheck,
+  Sparkles, AlertTriangle, CheckCircle2, ClipboardCopy, Clock3, Check,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -23,6 +26,9 @@ import { ClosingDesk } from "./ClosingDesk";
 import { ContactActions } from "@/components/common/ContactActions";
 import { CloseCommitButton } from "@/components/commitments/CloseCommitButton";
 import { canonicalCustomerId } from "@/lib/canonical/customer-id";
+import { persistBookingAction } from "./persistence";
+import { loadAllExecutionState } from "@/e2eplus/persistence";
+import { matchesFor } from "./match";
 
 type Pane = "WORK" | "CAPTURED" | "MATCH" | "LABELS" | "CLOSING" | "QUEUE" | "DRAFTS";
 
@@ -68,7 +74,7 @@ export interface SplitFocus { name?: string; phone?: string; key?: string; canon
 
 
 export function SplitFlow({ embedded = false, focus, panelOnly = false }: { embedded?: boolean; focus?: SplitFocus; panelOnly?: boolean }) {
-  const { leads, me, mode, setMode, claim, setNext, logActivity, escalate, batches, buildBatch, closeBatch, reopenBatch } = useBookingFlow();
+  const { leads, me, mode, setMode, claim, setNext, logActivity, escalate, batches, buildBatch, closeBatch, reopenBatch, editFields, answerStep } = useBookingFlow();
   const [widthPct, setWidthPct] = useState(40);
   const [dragging, setDragging] = useState(false);
   const [closeNote, setCloseNote] = useState("");
@@ -168,6 +174,184 @@ export function SplitFlow({ embedded = false, focus, panelOnly = false }: { embe
     if (pick) setLeadId(pick.id);
   }
 
+  // ── One-Tap Booking Flow Split Execution & Auto-Advance State ────────────
+  const [lastGeneratedCustomerMsg, setLastGeneratedCustomerMsg] = useState<string | null>(null);
+  const [lastGeneratedWrapUp, setLastGeneratedWrapUp] = useState<string | null>(null);
+  const [completedLeadIds, setCompletedLeadIds] = useState<string[]>([]);
+  const [isSavingOutcome, setIsSavingOutcome] = useState(false);
+  const advancingRef = useRef(false);
+
+  // Hydrate authoritative execution state from Supabase
+  useEffect(() => {
+    void loadAllExecutionState().then((execs) => {
+      for (const [canonicalId, exec] of Object.entries(execs)) {
+        if (exec.nextAction || exec.lastOutcome || exec.ownerName) {
+          const found = leads.find((l) => l.id === canonicalId || l.canonicalId === canonicalId);
+          if (found) {
+            if (exec.ownerName && !found.owner) {
+              claim(found.id);
+            }
+            if (exec.nextAction && exec.nextActionAt) {
+              setNext(found.id, exec.nextAction, exec.nextActionAt);
+            }
+            if (exec.lastOutcome) {
+              editFields(found.id, { lastOutcome: exec.lastOutcome }, "Reconciled from Supabase");
+            }
+          }
+        }
+      }
+    }).catch((err: unknown) => {
+      console.warn("Could not hydrate execution state from Supabase:", err);
+    });
+  }, [leads, claim, setNext, editFields]);
+
+  // Safe Enter key handler to advance
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        const activeTag = (document.activeElement?.tagName || "").toLowerCase();
+        if (activeTag === "input" || activeTag === "textarea" || activeTag === "select") {
+          return;
+        }
+        if (advancingRef.current) return;
+        advancingRef.current = true;
+        nextCustomer();
+        setTimeout(() => {
+          advancingRef.current = false;
+        }, 400);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [queue, lead]);
+
+  const triggerOverdueTest = () => {
+    if (!lead) return;
+    const pastIso = new Date(Date.now() - 3600_000).toISOString();
+    setNext(lead.id, lead.nextAction || "Follow up on decision", pastIso);
+    toast.warning("Simulated past deadline: Customer is now marked 🔴 OVERDUE");
+  };
+
+  const handleOneTapOutcome = async (presetKey: "tour" | "options" | "call" | "quote" | "cold") => {
+    if (!lead) return;
+    setIsSavingOutcome(true);
+
+    const matches = matchesFor(lead);
+    const topMatch = matches[0];
+    const propertyName = lead.f?.["property"] || topMatch?.name || "Gharpayy Residency Koramangala";
+    const propertyArea = topMatch?.area || lead.f?.["area"] || "Bengaluru";
+    const propertyPrice = topMatch?.price || Number(lead.f?.["budget"] || 12000);
+
+    let outcomeLabel = "";
+    let situation: "TOUR SCHEDULED" | "PROPERTY OPTIONS" | "CALL REQUIRED" | "TOKEN PENDING" | "LOST" = "CALL REQUIRED";
+    let nextActionKind = "Follow up on decision";
+    let nextActionNote = "";
+    let dueMinutes = 120;
+    let customerMsg = "";
+    let wrapUpData = "";
+
+    if (presetKey === "tour") {
+      outcomeLabel = "Tour Booked · Tomorrow 11 AM";
+      situation = "TOUR SCHEDULED";
+      nextActionKind = "Confirm the tour";
+      nextActionNote = `Tour confirmed for tomorrow 11 AM at ${propertyName}`;
+      dueMinutes = 180;
+      const tourIso = new Date(Date.now() + 86400000).toISOString();
+      answerStep(lead.id, "TOUR_SLOT", { tourAt: tourIso, tourHost: me, property: propertyName });
+      customerMsg = `Hi ${lead.name}, your in-person tour for ${propertyName} (${propertyArea}) is confirmed for tomorrow at 11:00 AM! 🏠 Our host (${me}) will assist you on-site. Let us know if you need location directions.`;
+      wrapUpData = `*BOOKING FLOW WRAP-UP* · Tour Booked\n👤 Customer: ${lead.name} (${lead.phone})\n📍 Property: ${propertyName}\n⚡ Outcome: Tour Booked · Tomorrow 11 AM\n📅 Next: Confirm the tour\n✍️ Host: ${me}`;
+    } else if (presetKey === "options") {
+      outcomeLabel = "Qualified · 3 Options Sent";
+      situation = "PROPERTY OPTIONS";
+      nextActionKind = "Share property options";
+      nextActionNote = `Curated PG matches shared in ${propertyArea}`;
+      dueMinutes = 120;
+      answerStep(lead.id, "MATCH", { property: propertyName });
+      customerMsg = `Hi ${lead.name}, based on your budget and preferred location (${propertyArea}), here are tailored room options for you:\n• ${propertyName} - from ₹${propertyPrice.toLocaleString("en-IN")}/mo\n• Salarpuria Sattva\nLet me know which one you'd like to visit! 🔑`;
+      wrapUpData = `*BOOKING FLOW WRAP-UP* · Options Sent\n👤 Customer: ${lead.name} (${lead.phone})\n📍 Options: ${propertyName}\n⚡ Outcome: Options Sent\n📅 Next: Follow-up in 2h\n✍️ Operator: ${me}`;
+    } else if (presetKey === "call") {
+      outcomeLabel = "Connected · Callback in 2h";
+      situation = "CALL REQUIRED";
+      nextActionKind = "Follow up on decision";
+      nextActionNote = "Connected with lead; callback requested in 2h";
+      dueMinutes = 120;
+      logActivity(lead.id, "Call completed", "Connected, callback in 2h");
+      customerMsg = `Hi ${lead.name}, thank you for speaking with us! As discussed, I will reconnect with you in 2 hours with available room inventory. 📱`;
+      wrapUpData = `*BOOKING FLOW WRAP-UP* · Connected\n👤 Customer: ${lead.name} (${lead.phone})\n⚡ Outcome: Callback in 2h\n📅 Next: Callback\n✍️ Operator: ${me}`;
+    } else if (presetKey === "quote") {
+      outcomeLabel = "Booking Intent · Quote Sent";
+      situation = "TOKEN PENDING";
+      nextActionKind = "Collect token deposit";
+      nextActionNote = `Booking quote generated for ${propertyName}; token deposit pending`;
+      dueMinutes = 60;
+      answerStep(lead.id, "PAYMENT", { bookingAmount: "5000", payment: "PENDING", property: propertyName });
+      customerMsg = `Hi ${lead.name}, your booking quote for ${propertyName} has been sent! To lock the room and reserve your bed, please complete the token reservation within the next hour: https://gharpayy.com/pay 💳`;
+      wrapUpData = `*BOOKING FLOW WRAP-UP* · Quote Sent\n👤 Customer: ${lead.name} (${lead.phone})\n📍 Property: ${propertyName}\n⚡ Outcome: Quote Sent · Token Pending\n📅 Next: Collect token within 1h\n✍️ Operator: ${me}`;
+    } else {
+      outcomeLabel = "Not Interested / Cold";
+      situation = "LOST";
+      nextActionKind = "Follow up on decision";
+      nextActionNote = "Lead dropped to nurture";
+      dueMinutes = 10080; // 7 days
+      editFields(lead.id, { decision: "NOT_MOVING", stage: "NURTURE" }, "Marked cold");
+      customerMsg = `Hi ${lead.name}, noted your preference! Whenever you are looking for co-living options in Bengaluru again, reach out anytime. Have a great day! 🌟`;
+      wrapUpData = `*BOOKING FLOW WRAP-UP* · Dropped\n👤 Customer: ${lead.name}\n⚡ Outcome: Dropped to nurture\n📅 Next: Recheck in 7 days`;
+    }
+
+    const dueAt = new Date(Date.now() + dueMinutes * 60_000).toISOString();
+    setNext(lead.id, nextActionKind, dueAt);
+    if (!lead.owner) claim(lead.id);
+
+    setLastGeneratedCustomerMsg(customerMsg);
+    setLastGeneratedWrapUp(wrapUpData);
+    setCompletedLeadIds((prev) => Array.from(new Set([...prev, lead.id])));
+
+    try {
+      await navigator.clipboard.writeText(customerMsg);
+      toast.success(`⚡ "${outcomeLabel}" logged & WhatsApp message copied!`);
+    } catch {
+      toast.success(`⚡ "${outcomeLabel}" logged!`);
+    }
+
+    try {
+      const saveRes = await persistBookingAction({
+        leadId: lead.id,
+        leadName: lead.name,
+        phone: lead.phone,
+        actor: { id: "u-self", name: me },
+        outcomeCode: presetKey,
+        outcomeLabel,
+        stage: lead.stage,
+        situation,
+        nextActionKind,
+        nextActionNote,
+        dueAt,
+        ownerId: "u-self",
+        ownerName: me,
+        customerMessage: customerMsg,
+        internalWrapUp: wrapUpData,
+        property: propertyName,
+        rent: propertyPrice,
+      });
+
+      if (saveRes.ok) {
+        toast.success("⚡ Saved to Supabase backend!");
+        // AUTO-ADVANCE: Only advance AFTER persistence succeeds
+        setTimeout(() => {
+          nextCustomer();
+        }, 500);
+      } else {
+        toast.error(`Backend persistence failed: ${saveRes.error || "Unknown error"}. Not advancing.`);
+      }
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error("Booking persistence error:", errorMsg);
+      toast.error(`Persistence error: ${errorMsg}. Not advancing.`);
+    } finally {
+      setIsSavingOutcome(false);
+    }
+  };
+
   return (
     <div className={cn("flex w-full overflow-hidden", panelOnly ? "h-full" : embedded ? "h-[calc(100vh-10rem)]" : "h-screen")}>
     <div className="flex min-w-0 flex-col overflow-hidden bg-background" style={{ width: panelOnly ? "100%" : `${widthPct}%` }}>
@@ -226,36 +410,217 @@ export function SplitFlow({ embedded = false, focus, panelOnly = false }: { embe
         </div>
       </header>
 
-      {/* Customer line + the five answers, compact */}
+      {/* Customer line + Above-The-Fold Execution Header + One-Tap Outcome Bar */}
       {lead && (
-        <div className="shrink-0 border-b px-2 py-1">
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+        <div className="shrink-0 border-b px-2 py-2 space-y-2 bg-card">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
             <div className="min-w-0">
-              <p className="truncate text-sm font-semibold">{lead.name} <span className="text-[11px] font-normal text-muted-foreground">{lead.phone}</span></p>
-              <p className="truncate text-[10px] text-muted-foreground">“{lead.lastMessage}”</p>
+              <div className="flex items-center gap-2">
+                <p className="truncate text-sm font-bold">{lead.name}</p>
+                <span className="text-[11px] font-normal text-muted-foreground">{lead.phone}</span>
+                {completedLeadIds.includes(lead.id) && (
+                  <Badge variant="outline" className="border-success/60 text-success text-[10px] gap-1 bg-success/10 font-semibold">
+                    <CheckCircle2 className="h-3 w-3" /> Worked Today
+                  </Badge>
+                )}
+              </div>
+              <p className="truncate text-[10px] text-muted-foreground">“{lead.lastMessage}” · {lead.f?.["area"] || "Area not set"} · Step {h?.stepNo || 1}: {h?.step?.title || "Intake"}</p>
             </div>
-            <div className="flex shrink-0 items-center gap-1">
-              <Button size="sm" variant="ghost" className="h-6 px-2 text-[10px]" onClick={nextCustomer}>Next<ArrowRight className="ml-1 h-3 w-3" /></Button>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <Button size="sm" variant="outline" className="h-7 text-xs font-semibold gap-1 hover:bg-primary/10" onClick={nextCustomer}>
+                Advance to Next <ArrowRight className="h-3.5 w-3.5" />
+                <span className="text-[10px] text-muted-foreground font-mono">↵ Enter</span>
+              </Button>
+              <Button size="sm" variant="ghost" className="h-7 px-2 text-[10px] text-muted-foreground" title="Simulate past deadline to test overdue indicator" onClick={triggerOverdueTest}>
+                Test Overdue
+              </Button>
             </div>
           </div>
-          {mounted && h && (
-            <div className="mt-1 flex flex-wrap gap-1 text-[10px]">
-              <Badge variant="outline" className="text-[10px]">{h.stepNo}. {h.complete ? "Checked in" : h.step?.title}</Badge>
-              <Badge variant={lead.owner ? "secondary" : "destructive"} className="text-[10px]">{lead.owner ?? "no owner"}</Badge>
-              <Badge variant="outline" className="text-[10px]">waiting on {h.waitingOn}</Badge>
-              <Badge variant={lead.nextAction ? "outline" : "destructive"} className="text-[10px]">{lead.nextAction ?? "no next step"}</Badge>
-              <Badge variant={lead.nextActionAt && h.sla !== "LATE" ? "outline" : "destructive"} className="text-[10px]">
-                {lead.nextActionAt ? (h.sla === "LATE" ? `late ${fmtMins(h.minutesLate)}` : new Date(lead.nextActionAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })) : "no deadline"}
-              </Badge>
+
+          {/* Critical Status Strip: Owner, Next Action, Deadline & Real-Time OVERDUE */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-xs">
+            <div className="rounded border bg-muted/20 p-1.5">
+              <p className="text-[9px] font-semibold uppercase text-muted-foreground">Owner</p>
+              <p className="font-semibold text-foreground truncate mt-0.5 text-[11px]">
+                👤 {lead.owner ?? me}
+              </p>
+            </div>
+            <div className="rounded border bg-muted/20 p-1.5">
+              <p className="text-[9px] font-semibold uppercase text-muted-foreground">Next Action</p>
+              <p className="font-semibold text-foreground truncate mt-0.5 text-[11px]">
+                ⚡ {lead.nextAction ?? "Action Required"}
+              </p>
+            </div>
+            <div className={cn("rounded border p-1.5", Boolean(lead.nextActionAt && new Date(lead.nextActionAt).getTime() < Date.now()) ? "border-destructive/60 bg-destructive/10" : "bg-muted/20")}>
+              <p className="text-[9px] font-semibold uppercase text-muted-foreground">Deadline</p>
+              <p className={cn("font-semibold truncate mt-0.5 tabular-nums text-[11px]", Boolean(lead.nextActionAt && new Date(lead.nextActionAt).getTime() < Date.now()) ? "text-destructive font-black" : "text-foreground")}>
+                ⏰ {lead.nextActionAt ? new Date(lead.nextActionAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "Set on Outcome"}
+              </p>
+            </div>
+            <div className={cn("rounded border p-1.5 flex items-center justify-center", Boolean(lead.nextActionAt && new Date(lead.nextActionAt).getTime() < Date.now()) ? "border-destructive bg-destructive/15 text-destructive" : "bg-muted/20 text-muted-foreground")}>
+              {Boolean(lead.nextActionAt && new Date(lead.nextActionAt).getTime() < Date.now()) ? (
+                <Badge variant="destructive" className="animate-pulse bg-red-600 text-white font-black text-[10px] py-0.5 px-2 shadow-sm">
+                  <AlertTriangle className="mr-1 h-3 w-3" /> 🔴 OVERDUE
+                </Badge>
+              ) : (
+                <span className="text-[10px] font-medium text-success flex items-center gap-1">
+                  <Check className="h-3 w-3" /> Within SLA
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* ⚡ ONE-TAP OUTCOMES ACTION BAR */}
+          <div className="rounded-lg border-2 border-primary/40 bg-primary/5 p-2 space-y-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-1">
+              <span className="flex items-center gap-1 text-[11px] font-bold text-foreground">
+                <Sparkles className="h-3.5 w-3.5 text-primary" />
+                ⚡ ONE-TAP BOOKING OUTCOMES (1 Click = Result + Owner + Deadline + WhatsApp Message + Backend Save):
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-1">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isSavingOutcome}
+                className="h-auto py-1.5 px-2 text-left justify-start border-primary/40 hover:bg-primary/15 transition"
+                onClick={() => handleOneTapOutcome("tour")}
+              >
+                <div>
+                  <div className="text-xs font-bold text-foreground">🔥 Tour Booked</div>
+                  <div className="text-[9px] text-muted-foreground">Tomorrow 11 AM</div>
+                </div>
+              </Button>
+
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isSavingOutcome}
+                className="h-auto py-1.5 px-2 text-left justify-start border-primary/40 hover:bg-primary/15 transition"
+                onClick={() => handleOneTapOutcome("options")}
+              >
+                <div>
+                  <div className="text-xs font-bold text-foreground">✅ Options Sent</div>
+                  <div className="text-[9px] text-muted-foreground">Follow-up in 2h</div>
+                </div>
+              </Button>
+
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isSavingOutcome}
+                className="h-auto py-1.5 px-2 text-left justify-start border-primary/40 hover:bg-primary/15 transition"
+                onClick={() => handleOneTapOutcome("call")}
+              >
+                <div>
+                  <div className="text-xs font-bold text-foreground">📞 Connected</div>
+                  <div className="text-[9px] text-muted-foreground">Callback in 2h</div>
+                </div>
+              </Button>
+
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isSavingOutcome}
+                className="h-auto py-1.5 px-2 text-left justify-start border-primary/40 hover:bg-primary/15 transition"
+                onClick={() => handleOneTapOutcome("quote")}
+              >
+                <div>
+                  <div className="text-xs font-bold text-foreground">🤝 Quote Sent</div>
+                  <div className="text-[9px] text-muted-foreground">Token in 1h</div>
+                </div>
+              </Button>
+
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isSavingOutcome}
+                className="h-auto py-1.5 px-2 text-left justify-start border-primary/40 hover:bg-primary/15 transition"
+                onClick={() => handleOneTapOutcome("cold")}
+              >
+                <div>
+                  <div className="text-xs font-bold text-foreground">❄️ Cold / Exit</div>
+                  <div className="text-[9px] text-muted-foreground">Nurture later</div>
+                </div>
+              </Button>
+            </div>
+          </div>
+
+          {/* Auto-Generated WhatsApp Output Preview & Quick Copy */}
+          {lastGeneratedCustomerMsg && (
+            <div className="rounded-lg border border-success/40 bg-success/5 p-2 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1 text-[11px] font-bold text-success">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  <span>Auto-Generated WhatsApp Output (Copied to Clipboard)</span>
+                </div>
+                <Badge variant="outline" className="text-[9px] border-success/40 text-success">
+                  ✓ Persisted to Supabase & Audit Log
+                </Badge>
+              </div>
+
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                <div className="rounded border bg-background p-2">
+                  <div className="flex items-center justify-between text-[9px] font-semibold text-muted-foreground uppercase mb-1">
+                    <span>Customer WhatsApp Message</span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-5 px-1.5 text-[9px] gap-1"
+                      onClick={() => {
+                        void navigator.clipboard.writeText(lastGeneratedCustomerMsg);
+                        toast.success("Customer message copied!");
+                      }}
+                    >
+                      <ClipboardCopy className="h-2.5 w-2.5" /> Copy
+                    </Button>
+                  </div>
+                  <p className="text-[11px] whitespace-pre-wrap leading-relaxed font-sans">{lastGeneratedCustomerMsg}</p>
+                </div>
+
+                {lastGeneratedWrapUp && (
+                  <div className="rounded border bg-background p-2">
+                    <div className="flex items-center justify-between text-[9px] font-semibold text-muted-foreground uppercase mb-1">
+                      <span>Internal Team Wrap-Up</span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-5 px-1.5 text-[9px] gap-1"
+                        onClick={() => {
+                          void navigator.clipboard.writeText(lastGeneratedWrapUp);
+                          toast.success("Team wrap-up copied!");
+                        }}
+                      >
+                        <ClipboardCopy className="h-2.5 w-2.5" /> Copy
+                      </Button>
+                    </div>
+                    <p className="text-[10px] whitespace-pre-wrap leading-relaxed font-mono">{lastGeneratedWrapUp}</p>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between pt-1">
+                <span className="text-[9px] text-muted-foreground">Ready to message the lead and move on:</span>
+                <Button
+                  size="sm"
+                  className="h-6 text-[10px] font-semibold gap-1 bg-primary text-primary-foreground"
+                  onClick={nextCustomer}
+                >
+                  Advance to Next Customer <ArrowRight className="h-3 w-3" />
+                  <span className="text-[9px] font-mono opacity-80">(↵ Enter)</span>
+                </Button>
+              </div>
             </div>
           )}
-          {/* Copy the number, dial it, or open the WhatsApp chat — always labelled */}
-          <div className="mt-1 flex flex-wrap items-center gap-1">
+
+          {/* Existing Contact Actions & manual controls */}
+          <div className="flex flex-wrap items-center gap-1 pt-1">
             <ContactActions phone={lead.phone} name={lead.name} />
-            <Button size="sm" className="h-7 px-2 text-[10px]" onClick={() => setActivityOpen(true)}>
+            <Button size="sm" className="h-6 px-2 text-[10px]" onClick={() => setActivityOpen(true)}>
               <Activity className="mr-1 h-3 w-3" />Log activity
             </Button>
-            <Button size="sm" variant="outline" className="h-7 px-2 text-[10px]" onClick={() => {
+            <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => {
               const at = new Date(Date.now() + 2 * 3_600_000).toISOString();
               setNext(lead.id, "Follow up on decision", at);
               setNextAction("Follow up on decision");

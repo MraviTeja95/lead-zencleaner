@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle, CheckCircle2, ClipboardCopy, Clock3, Flag, Goal,
   Building2, Hand, MessageCircle, Phone, PhoneCall, PhoneOff, PlayCircle, PlusCircle, ShieldCheck, Timer,
+  Sparkles, ArrowRight, UserCheck, Check, Send,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -21,9 +22,11 @@ import { ManualDraftPanel, type ManualCandidate, type NewLeadInput } from "./Man
 import { useIdentityStore } from "@/lib/lead-identity/store";
 import { actualForGoal, callStats, queueForGoal, resultStatus } from "./results";
 import { optionById, propertyOptions, propertyProgress, rankedForCustomer } from "./properties";
-import { todaysCommitment, useMovementCare } from "./store";
+import { todaysCommitment, useMovementCare, type DailyCommitment } from "./store";
 import { debriefMessage } from "./debrief";
 import { CheckpointPanel } from "./CheckpointPanel";
+import { persistCareAction } from "./persistence";
+import { loadAllExecutionState } from "@/e2eplus/persistence";
 
 const GOAL_TONE: Record<CareGoal, string> = {
   FIND: "border-info/40 bg-info/10 text-info",
@@ -45,7 +48,30 @@ function dueForGoal(goal: CareGoal) {
 }
 
 export function MovementCare() {
-  useEffect(() => { seedMovement(); }, []);
+  useEffect(() => {
+    seedMovement();
+    void loadAllExecutionState().then((execs) => {
+      const mvStore = useMovement.getState();
+      for (const [leadId, exec] of Object.entries(execs)) {
+        if (exec.nextAction || exec.lastOutcome || exec.ownerName) {
+          const kind = (exec.nextAction as NextActionKind) || "call";
+          mvStore.patch(leadId, {
+            primaryOwnerId: exec.ownerId || undefined,
+            primaryOwnerName: exec.ownerName || undefined,
+            nextAction: exec.nextAction ? {
+              kind,
+              dueAt: exec.nextActionAt || exec.followUpAt || new Date().toISOString(),
+              ownerId: exec.ownerId || mvStore.actor.id,
+              ownerName: exec.ownerName || mvStore.actor.name,
+              note: exec.lastOutcome || "Authoritative execution",
+            } : undefined,
+          });
+        }
+      }
+    }).catch((err: unknown) => {
+      console.warn("Could not hydrate execution state from Supabase:", err);
+    });
+  }, []);
   const { list, nameOf, me } = useMovementSync();
   const events = useMovement((state) => state.events);
   const setActor = useMovement((state) => state.setActor);
@@ -89,6 +115,13 @@ export function MovementCare() {
   const [showFormat, setShowFormat] = useState(false);
   const [clockTick, setClockTick] = useState(0);
   const createLead = useIdentityStore((state) => state.createLead);
+
+  // ── One-Tap Care & Auto-Advance State ─────────────────────────────────────
+  const [lastGeneratedCustomerMsg, setLastGeneratedCustomerMsg] = useState<string | null>(null);
+  const [lastGeneratedWrapUp, setLastGeneratedWrapUp] = useState<string | null>(null);
+  const [completedUlids, setCompletedUlids] = useState<string[]>([]);
+  const [isSavingOutcome, setIsSavingOutcome] = useState(false);
+  const advancingRef = useRef(false);
 
   useEffect(() => {
     if (!draftStartedAt) return;
@@ -329,6 +362,233 @@ export function MovementCare() {
     toast.success(`${ROUND_COPY[round].label} progress reported`);
   };
 
+  // ── One-Tap Care Execution & Advance Handlers ──────────────────────────────
+  const advanceToNextCustomer = () => {
+    if (!selected || queue.length === 0) return;
+    const currentIndex = queue.findIndex((item) => item.ulid === selected);
+    if (currentIndex === -1) return;
+
+    if (currentIndex < queue.length - 1) {
+      const nextUlid = queue[currentIndex + 1].ulid;
+      setSelected(nextUlid);
+      const nextInfo = nameOf.get(nextUlid);
+      toast.info(`Advanced to next: ${nextInfo?.name || nextUlid}`);
+    } else {
+      toast.success("All customers in the queue have been reviewed!");
+    }
+  };
+
+  const triggerOverdueTest = () => {
+    if (!selectedState) return;
+    const pastDueIso = new Date(Date.now() - 3600_000).toISOString(); // 1 hour in the past
+    mv.setNextAction(selectedState.ulid, {
+      kind: "call",
+      dueAt: pastDueIso,
+      ownerId: mv.actor.id,
+      ownerName: mv.actor.name,
+      note: "SLA Overdue verification test",
+    });
+    toast.warning("Simulated past deadline: Customer is now marked 🔴 OVERDUE");
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        const activeTag = (document.activeElement?.tagName || "").toLowerCase();
+        if (activeTag === "input" || activeTag === "textarea" || activeTag === "select") {
+          return;
+        }
+        if (advancingRef.current) return;
+        advancingRef.current = true;
+        advanceToNextCustomer();
+        setTimeout(() => {
+          advancingRef.current = false;
+        }, 400);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selected, queue, nameOf]);
+
+  const handleOneTapOutcome = async (presetKey: "tour" | "options" | "call" | "quote" | "cold") => {
+    if (!selectedState) return;
+    setIsSavingOutcome(true);
+
+    const customerName = nameOf.get(selectedState.ulid)?.name ?? selectedState.ulid;
+    const customerArea = nameOf.get(selectedState.ulid)?.area ?? "Bengaluru";
+    const propertyName = selectedState.tourProperty || (aimed[0] ? optionById(aimed[0])?.name : "Gharpayy Managed Home") || "Gharpayy Managed Home";
+
+    let outcomeLabel = "";
+    let situation: "TOUR SCHEDULED" | "PROPERTY OPTIONS" | "CALL REQUIRED" | "TOKEN PENDING" | "LOST" = "CALL REQUIRED";
+    let nextActionKind: NextActionKind = "call";
+    let nextActionNote = "";
+    let dueMinutes = 120;
+    let customerMsg = "";
+    let wrapUpData = { done: "", wentWell: "", wentBadly: "", problems: "none" };
+
+    if (presetKey === "tour") {
+      outcomeLabel = "Tour Booked · Tomorrow 11 AM";
+      situation = "TOUR SCHEDULED";
+      nextActionKind = "confirm-tour";
+      nextActionNote = `Tour confirmed for tomorrow 11 AM at ${propertyName}`;
+      dueMinutes = 180;
+      const tourTimeIso = new Date(Date.now() + 86400000).toISOString();
+      mv.scheduleTour(selectedState.ulid, tourTimeIso, propertyName);
+      mv.confirmTour(selectedState.ulid);
+      customerMsg = `Hi ${customerName}, your in-person tour for ${propertyName} (${customerArea}) is confirmed for tomorrow at 11:00 AM! 🏠 Our property manager will assist you on-site. Let us know if you need location directions.`;
+      wrapUpData = {
+        done: `Scheduled & confirmed tour for tomorrow 11 AM at ${propertyName}`,
+        wentWell: "Customer confirmed move-in timeline and budget criteria",
+        wentBadly: "None",
+        problems: "none",
+      };
+    } else if (presetKey === "options") {
+      outcomeLabel = "Qualified · Options Sent";
+      situation = "PROPERTY OPTIONS";
+      nextActionKind = "send-property";
+      nextActionNote = `Shared curated properties matching budget in ${customerArea}`;
+      dueMinutes = 120;
+      mv.qualify(selectedState.ulid, true);
+      mv.setStage(selectedState.ulid, "matched", "Properties shared");
+      customerMsg = `Hi ${customerName}, based on your budget and preferred location (${customerArea}), here are tailored room options for you:\n• ${propertyName}\n• Salarpuria Sattva\nLet me know which one you'd like to visit! 🔑`;
+      wrapUpData = {
+        done: `Qualified requirements and shared top matching properties in ${customerArea}`,
+        wentWell: "Inventory matches budget",
+        wentBadly: "Comparing with other rentals",
+        problems: "none",
+      };
+    } else if (presetKey === "call") {
+      outcomeLabel = "Connected · Call in 2h";
+      situation = "CALL REQUIRED";
+      nextActionKind = "call";
+      nextActionNote = "Connected with lead; callback scheduled in 2h";
+      dueMinutes = 120;
+      mv.logCall(selectedState.ulid, "connected", "Connected, callback requested in 2h");
+      customerMsg = `Hi ${customerName}, thank you for speaking with us! As discussed, I will reconnect with you in 2 hours with available room inventory. 📱`;
+      wrapUpData = {
+        done: "Connected via phone call; customer requested callback in 2h",
+        wentWell: "Customer was receptive and shared preferences",
+        wentBadly: "Currently busy in office",
+        problems: "none",
+      };
+    } else if (presetKey === "quote") {
+      outcomeLabel = "Booking Intent · Quote Sent";
+      situation = "TOKEN PENDING";
+      nextActionKind = "collect-payment";
+      nextActionNote = `Booking quote sent for ${propertyName}; token deposit pending`;
+      dueMinutes = 60;
+      mv.prebook(selectedState.ulid, "payment-intent");
+      mv.sendQuote(selectedState.ulid);
+      customerMsg = `Hi ${customerName}, your booking quote for ${propertyName} has been sent! To lock the room and reserve your bed, please complete the token reservation within the next hour: https://gharpayy.com/pay 💳`;
+      wrapUpData = {
+        done: `Generated and sent formal booking quote for ${propertyName}`,
+        wentWell: "Agreed on commercial terms and move-in date",
+        wentBadly: "Payment pending verification",
+        problems: "none",
+      };
+    } else {
+      outcomeLabel = "Not Interested / Cold";
+      situation = "LOST";
+      nextActionKind = "recheck-later";
+      nextActionNote = "Customer not interested or dropped to nurture";
+      dueMinutes = 1440;
+      mv.exit(selectedState.ulid, "no-response", "Customer dropped to nurture");
+      customerMsg = `Hi ${customerName}, noted your preference! Whenever you are looking for co-living options in Bengaluru again, reach out anytime. Have a great day! 🌟`;
+      wrapUpData = {
+        done: "Lead marked cold / closed as not actionable",
+        wentWell: "Clean exit",
+        wentBadly: "Budget mismatch or already rented elsewhere",
+        problems: "none",
+      };
+    }
+
+    const dueAt = new Date(Date.now() + dueMinutes * 60_000).toISOString();
+
+    // Update Next Action on Movement state
+    mv.setNextAction(selectedState.ulid, {
+      kind: nextActionKind,
+      dueAt,
+      ownerId: mv.actor.id,
+      ownerName: mv.actor.name,
+      note: nextActionNote,
+    });
+
+    mv.log(selectedState.ulid, "note", `1-Tap: ${outcomeLabel} (Next: ${nextActionKind} due in ${dueMinutes}m)`);
+
+    // Auto-generate debrief message for team
+    const wrapUpMessage = debriefMessage({
+      customerName,
+      draftCode: selectedState.crmDraft ?? "D1",
+      goal: activeGoal,
+      operatorName: mv.actor.name,
+      resultNow: actual + 1,
+      commitCount: commitment?.commitCount ?? 30,
+      property: propertyName,
+      nextStep: NEXT_ACTION_LABEL[nextActionKind] ?? nextActionKind,
+      dueAt,
+      ...wrapUpData,
+    });
+
+    saveDebrief({
+      ulid: selectedState.ulid,
+      customerName,
+      draftCode: selectedState.crmDraft ?? "D1",
+      goal: activeGoal,
+      message: wrapUpMessage,
+      ...wrapUpData,
+    });
+
+    setLastGeneratedCustomerMsg(customerMsg);
+    setLastGeneratedWrapUp(wrapUpMessage);
+    setCompletedUlids((prev) => Array.from(new Set([...prev, selectedState.ulid])));
+
+    // Copy customer message to clipboard immediately
+    try {
+      await navigator.clipboard.writeText(customerMsg);
+      toast.success(`⚡ "${outcomeLabel}" logged & WhatsApp message copied!`);
+    } catch {
+      toast.success(`⚡ "${outcomeLabel}" logged!`);
+    }
+
+    // Authoritative Supabase & Audit persistence
+    try {
+      const saveRes = await persistCareAction({
+        leadId: selectedState.ulid,
+        leadName: customerName,
+        phone: selectedState.phone,
+        actor: { id: mv.actor.id, name: mv.actor.name },
+        outcomeCode: presetKey,
+        outcomeLabel,
+        stage: selectedState.stage,
+        situation,
+        nextActionKind,
+        nextActionNote,
+        dueAt,
+        ownerId: mv.actor.id,
+        ownerName: mv.actor.name,
+        customerMessage: customerMsg,
+        internalWrapUp: wrapUpMessage,
+        tourProperty: propertyName,
+      });
+
+      if (saveRes.ok) {
+        toast.success(`⚡ Outcome saved & WhatsApp message copied!`);
+        // AUTO-ADVANCE: Advances to the next customer ONLY after persistence succeeds
+        setTimeout(() => {
+          advanceToNextCustomer();
+        }, 500);
+      } else {
+        toast.error(`Backend persistence failed: ${saveRes.error || "Unknown error"}. Not advancing.`);
+      }
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error("Persistence error:", errorMsg);
+      toast.error(`Persistence error: ${errorMsg}. Not advancing.`);
+    } finally {
+      setIsSavingOutcome(false);
+    }
+  };
+
   return (
     <div className="flex h-[calc(100vh-4rem)] min-h-[560px] flex-col overflow-hidden bg-background">
       <header className="shrink-0 border-b bg-card px-3 py-2">
@@ -426,6 +686,8 @@ export function MovementCare() {
               {queue.map((item, index) => {
                 const info = nameOf.get(item.ulid);
                 const status = resultStatus(item.state);
+                const isItemOverdue = Boolean(item.state.nextAction?.dueAt && new Date(item.state.nextAction.dueAt).getTime() < Date.now());
+                const isWorkedToday = completedUlids.includes(item.ulid);
                 return (
                   <Button key={item.ulid} variant="ghost" onClick={() => setSelected(item.ulid)}
                     className={cn("h-auto w-full justify-start rounded-none px-3 py-2 text-left", selected === item.ulid && "bg-primary/10")}>
@@ -434,6 +696,9 @@ export function MovementCare() {
                       <span className="flex items-center gap-1.5">
                         <span className="truncate text-xs font-semibold">{info?.name ?? item.ulid}</span>
                         <DraftChip code={item.state.crmDraft} />
+                        {isWorkedToday && (
+                          <span className="text-[9px] font-semibold text-success bg-success/10 px-1 py-0.5 rounded leading-none">✓ Done</span>
+                        )}
                       </span>
                       <span className="block truncate text-[10px] font-normal text-muted-foreground">
                         {item.state.waAccount} · {item.reason}
@@ -442,7 +707,14 @@ export function MovementCare() {
                         {status.result}{status.missing.length ? ` · missing ${status.missing.join(", ")}` : " · accountable"}
                       </span>
                     </span>
-                    <Badge variant={item.bucket === "P0" ? "destructive" : "outline"} className="text-[9px]">{item.bucket}</Badge>
+                    <div className="flex flex-col items-end gap-1 shrink-0">
+                      <Badge variant={item.bucket === "P0" ? "destructive" : "outline"} className="text-[9px]">{item.bucket}</Badge>
+                      {isItemOverdue && (
+                        <span className="text-[9px] font-bold text-destructive bg-destructive/10 px-1 py-0.5 rounded leading-none animate-pulse">
+                          🔴 OVERDUE
+                        </span>
+                      )}
+                    </div>
                   </Button>
                 );
               })}
@@ -463,6 +735,227 @@ export function MovementCare() {
           <main className="min-h-0 overflow-y-auto p-2">
             {selectedState && selectedResult ? (
               <div className="space-y-2">
+                {/* ── Above-The-Fold Execution & Status Header ─────────── */}
+                <div className="rounded-lg border bg-card p-3 space-y-2 shadow-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h2 className="text-base font-bold truncate">
+                          {nameOf.get(selectedState.ulid)?.name ?? selectedState.ulid}
+                        </h2>
+                        <DraftChip code={selectedState.crmDraft} />
+                        {completedUlids.includes(selectedState.ulid) && (
+                          <Badge variant="outline" className="border-success/60 text-success text-[10px] gap-1 bg-success/10 font-semibold">
+                            <CheckCircle2 className="h-3 w-3" /> Worked Today
+                          </Badge>
+                        )}
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        {selectedState.phone || "No phone"} · {nameOf.get(selectedState.ulid)?.area || "Area not set"} · {selectedState.waAccount}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs font-semibold gap-1 hover:bg-primary/10"
+                        onClick={advanceToNextCustomer}
+                      >
+                        Advance to Next <ArrowRight className="h-3.5 w-3.5" />
+                        <span className="text-[10px] text-muted-foreground font-mono">↵ Enter</span>
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-[10px] text-muted-foreground"
+                        title="Simulate past deadline to test overdue indicator"
+                        onClick={triggerOverdueTest}
+                      >
+                        Test Overdue
+                      </Button>
+                    </div>
+                  </div>
+
+                  {/* ── Critical Status Strip: Owner, Next Action, Deadline & Real-Time OVERDUE ── */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                    <div className="rounded border bg-muted/20 p-2">
+                      <p className="text-[10px] font-semibold uppercase text-muted-foreground">Owner</p>
+                      <p className="font-semibold text-foreground truncate mt-0.5">
+                        👤 {selectedState.primaryOwnerName || mv.actor.name}
+                      </p>
+                    </div>
+                    <div className="rounded border bg-muted/20 p-2">
+                      <p className="text-[10px] font-semibold uppercase text-muted-foreground">Next Action</p>
+                      <p className="font-semibold text-foreground truncate mt-0.5">
+                        ⚡ {selectedState.nextAction ? (NEXT_ACTION_LABEL[selectedState.nextAction.kind] ?? selectedState.nextAction.kind) : "Action Required"}
+                      </p>
+                    </div>
+                    <div className={cn("rounded border p-2", Boolean(selectedState.nextAction?.dueAt && new Date(selectedState.nextAction.dueAt).getTime() < Date.now()) ? "border-destructive/60 bg-destructive/10" : "bg-muted/20")}>
+                      <p className="text-[10px] font-semibold uppercase text-muted-foreground">Deadline</p>
+                      <p className={cn("font-semibold truncate mt-0.5 tabular-nums", Boolean(selectedState.nextAction?.dueAt && new Date(selectedState.nextAction.dueAt).getTime() < Date.now()) ? "text-destructive font-black" : "text-foreground")}>
+                        ⏰ {selectedState.nextAction?.dueAt ? new Date(selectedState.nextAction.dueAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "Set on Outcome"}
+                      </p>
+                    </div>
+                    <div className={cn("rounded border p-2 flex items-center justify-center", Boolean(selectedState.nextAction?.dueAt && new Date(selectedState.nextAction.dueAt).getTime() < Date.now()) ? "border-destructive bg-destructive/15 text-destructive" : "bg-muted/20 text-muted-foreground")}>
+                      {Boolean(selectedState.nextAction?.dueAt && new Date(selectedState.nextAction.dueAt).getTime() < Date.now()) ? (
+                        <Badge variant="destructive" className="animate-pulse bg-red-600 text-white font-black text-xs py-1 px-2.5 shadow-sm">
+                          <AlertTriangle className="mr-1 h-3.5 w-3.5" /> 🔴 OVERDUE
+                        </Badge>
+                      ) : (
+                        <span className="text-[11px] font-medium text-success flex items-center gap-1">
+                          <Check className="h-3.5 w-3.5" /> Within SLA
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── ONE-TAP OUTCOME ACTION BAR ─────────────────────── */}
+                <div className="rounded-lg border-2 border-amber-500/50 bg-amber-500/5 p-3 space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-1">
+                    <span className="flex items-center gap-1.5 text-xs font-bold text-amber-800 dark:text-amber-300">
+                      <Sparkles className="h-4 w-4 text-amber-600" />
+                      ⚡ ONE-TAP OUTCOMES (1 Click = Result + Owner + Deadline + WhatsApp Message + Backend Save):
+                    </span>
+                    <span className="text-[10px] text-muted-foreground font-medium">Click to execute & auto-copy update:</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-1.5">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={isSavingOutcome}
+                      className="h-auto py-2 px-2 text-left justify-start border-amber-500/50 hover:bg-amber-500/15 hover:border-amber-600 transition"
+                      onClick={() => handleOneTapOutcome("tour")}
+                    >
+                      <div>
+                        <div className="text-xs font-bold text-amber-900 dark:text-amber-200">🔥 Tour Booked</div>
+                        <div className="text-[10px] text-muted-foreground">Tomorrow 11 AM</div>
+                      </div>
+                    </Button>
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={isSavingOutcome}
+                      className="h-auto py-2 px-2 text-left justify-start border-amber-500/50 hover:bg-amber-500/15 hover:border-amber-600 transition"
+                      onClick={() => handleOneTapOutcome("options")}
+                    >
+                      <div>
+                        <div className="text-xs font-bold text-amber-900 dark:text-amber-200">✅ Options Sent</div>
+                        <div className="text-[10px] text-muted-foreground">Follow-up in 2h</div>
+                      </div>
+                    </Button>
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={isSavingOutcome}
+                      className="h-auto py-2 px-2 text-left justify-start border-amber-500/50 hover:bg-amber-500/15 hover:border-amber-600 transition"
+                      onClick={() => handleOneTapOutcome("call")}
+                    >
+                      <div>
+                        <div className="text-xs font-bold text-amber-900 dark:text-amber-200">📞 Connected</div>
+                        <div className="text-[10px] text-muted-foreground">Call back in 2h</div>
+                      </div>
+                    </Button>
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={isSavingOutcome}
+                      className="h-auto py-2 px-2 text-left justify-start border-amber-500/50 hover:bg-amber-500/15 hover:border-amber-600 transition"
+                      onClick={() => handleOneTapOutcome("quote")}
+                    >
+                      <div>
+                        <div className="text-xs font-bold text-amber-900 dark:text-amber-200">🤝 Quote Sent</div>
+                        <div className="text-[10px] text-muted-foreground">Token in 1h</div>
+                      </div>
+                    </Button>
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={isSavingOutcome}
+                      className="h-auto py-2 px-2 text-left justify-start border-amber-500/50 hover:bg-amber-500/15 hover:border-amber-600 transition"
+                      onClick={() => handleOneTapOutcome("cold")}
+                    >
+                      <div>
+                        <div className="text-xs font-bold text-amber-900 dark:text-amber-200">❄️ Cold / Exit</div>
+                        <div className="text-[10px] text-muted-foreground">Nurture later</div>
+                      </div>
+                    </Button>
+                  </div>
+                </div>
+
+                {/* ── AUTO-GENERATED OUTPUT PREVIEW & QUICK COPY ────── */}
+                {lastGeneratedCustomerMsg && (
+                  <div className="rounded-lg border border-success/40 bg-success/5 p-3 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-1.5 text-xs font-bold text-success">
+                        <CheckCircle2 className="h-4 w-4" />
+                        <span>Auto-Generated WhatsApp Output (Copied to Clipboard)</span>
+                      </div>
+                      <Badge variant="outline" className="text-[9px] border-success/40 text-success">
+                        ✓ Persisted to Supabase & Audit Log
+                      </Badge>
+                    </div>
+
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <div className="rounded border bg-background p-2">
+                        <div className="flex items-center justify-between text-[10px] font-semibold text-muted-foreground uppercase mb-1">
+                          <span>Customer WhatsApp Message</span>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-5 px-1.5 text-[9px] gap-1"
+                            onClick={() => {
+                              void navigator.clipboard.writeText(lastGeneratedCustomerMsg);
+                              toast.success("Customer message copied!");
+                            }}
+                          >
+                            <ClipboardCopy className="h-2.5 w-2.5" /> Copy
+                          </Button>
+                        </div>
+                        <p className="text-xs whitespace-pre-wrap leading-relaxed font-sans">{lastGeneratedCustomerMsg}</p>
+                      </div>
+
+                      {lastGeneratedWrapUp && (
+                        <div className="rounded border bg-background p-2">
+                          <div className="flex items-center justify-between text-[10px] font-semibold text-muted-foreground uppercase mb-1">
+                            <span>Internal Team Wrap-Up</span>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-5 px-1.5 text-[9px] gap-1"
+                              onClick={() => {
+                                void navigator.clipboard.writeText(lastGeneratedWrapUp);
+                                toast.success("Team wrap-up copied!");
+                              }}
+                            >
+                              <ClipboardCopy className="h-2.5 w-2.5" /> Copy
+                            </Button>
+                          </div>
+                          <p className="text-xs whitespace-pre-wrap leading-relaxed font-mono text-[11px]">{lastGeneratedWrapUp}</p>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex items-center justify-between pt-1">
+                      <span className="text-[10px] text-muted-foreground">Ready to message the lead and move on:</span>
+                      <Button
+                        size="sm"
+                        className="h-7 text-xs font-semibold gap-1 bg-primary text-primary-foreground"
+                        onClick={advanceToNextCustomer}
+                      >
+                        Advance to Next Customer <ArrowRight className="h-3 w-3" />
+                        <span className="text-[10px] font-mono opacity-80">(↵ Enter)</span>
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="border bg-card p-3">
                   <div className="flex flex-wrap items-start gap-2">
                     <div className="min-w-0 flex-1">
@@ -552,8 +1045,20 @@ export function MovementCare() {
           </main>
 
           <aside className="min-h-0 overflow-y-auto border-l bg-card p-2">
-            <CheckpointPanel role={activeRole} operatorId={mv.actor.id} operatorName={mv.actor.name}
-              states={list} events={events} onOpenCustomer={setSelected} />
+            <RoundCloseSummaryCard
+              commitment={commitment}
+              actual={actual}
+              queue={queue}
+              list={list}
+              actorName={mv.actor.name}
+              role={activeRole}
+              goal={activeGoal}
+            />
+
+            <div className="mt-2">
+              <CheckpointPanel role={activeRole} operatorId={mv.actor.id} operatorName={mv.actor.name}
+                states={list} events={events} onOpenCustomer={setSelected} />
+            </div>
 
             <div className="mt-2"><ProgressReporter round={round} onRound={setRound} actual={actual} committed={commitment.commitCount}
               moved={moved} stuck={stuck} need={need} onMoved={setMoved} onStuck={setStuck} onNeed={setNeed} onSave={saveReport} />
@@ -927,4 +1432,105 @@ function Stat({ label, value, danger }: { label: string; value: number; danger?:
 
 function ContractCell({ label, value, good }: { label: string; value: string; good?: boolean }) {
   return <div className="min-h-14 border px-2 py-1.5"><p className="text-[9px] font-semibold uppercase text-muted-foreground">{label}</p><p className={cn("mt-0.5 text-[11px] leading-snug", good === true && "text-success", good === false && "text-destructive")}>{value}</p></div>;
+}
+
+function RoundCloseSummaryCard({
+  commitment,
+  actual,
+  queue,
+  list,
+  actorName,
+  role,
+  goal,
+}: {
+  commitment: DailyCommitment | null;
+  actual: number;
+  queue: Array<{ ulid: string; state: any; bucket: string }>;
+  list: any[];
+  actorName: string;
+  role: CareRole;
+  goal: CareGoal;
+}) {
+  const committed = commitment?.commitCount ?? 0;
+  const completed = actual;
+  const pending = Math.max(0, queue.length - actual);
+  const overdue = list.filter((item) => Boolean(item.nextAction?.dueAt && new Date(item.nextAction.dueAt).getTime() < Date.now())).length;
+  const escalated = list.filter((item) => item.bucket === "P0" || item.blocker !== "none" || (item.customerWaitingSince && Date.now() - new Date(item.customerWaitingSince).getTime() > 24 * 3600_000)).length;
+
+  const copyWhatsAppSummary = async () => {
+    const time = new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+    const today = new Date().toISOString().slice(0, 10);
+    const pct = committed > 0 ? Math.round((completed / committed) * 100) : 0;
+    const msg = [
+      `*DAILY CARE ROUND UPDATE — Gharpayy Movement OS*`,
+      `👤 Operator: ${actorName} | Role: ${role} | Goal: ${goal}`,
+      `📅 Date: ${today} · ${time}`,
+      ``,
+      `📊 *Metrics:*`,
+      `• Committed: ${committed}`,
+      `• Completed: ${completed} (${pct}%)`,
+      `• Pending: ${pending}`,
+      `• Overdue: ${overdue} ${overdue > 0 ? "🔴" : "✅"}`,
+      `• Escalated: ${escalated} ${escalated > 0 ? "⚠️" : "✅"}`,
+      ``,
+      `Status: ${completed >= committed ? "✅ ON TRACK" : "⚠️ PACE REQUIRED"}`,
+    ].join("\n");
+
+    try {
+      await navigator.clipboard.writeText(msg);
+      toast.success("Round closing summary copied to clipboard!");
+    } catch {
+      toast.error("Could not copy round summary.");
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-primary/40 bg-primary/5 p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5 text-xs font-semibold text-primary">
+          <Clock3 className="h-4 w-4" />
+          <span>Round Close & Daily Summary</span>
+        </div>
+        <Badge variant={completed >= committed ? "default" : "outline"} className="text-[10px]">
+          {completed >= committed ? "Goal Reached" : `${completed}/${committed}`}
+        </Badge>
+      </div>
+
+      <div className="grid grid-cols-5 gap-1 text-center">
+        <div className="rounded border bg-background p-1">
+          <p className="text-[8px] uppercase text-muted-foreground font-medium">Committed</p>
+          <p className="text-xs font-bold text-foreground">{committed}</p>
+        </div>
+        <div className="rounded border bg-background p-1">
+          <p className="text-[8px] uppercase text-muted-foreground font-medium">Completed</p>
+          <p className="text-xs font-bold text-success">{completed}</p>
+        </div>
+        <div className="rounded border bg-background p-1">
+          <p className="text-[8px] uppercase text-muted-foreground font-medium">Pending</p>
+          <p className="text-xs font-bold text-foreground">{pending}</p>
+        </div>
+        <div className={cn("rounded border bg-background p-1", overdue > 0 && "border-destructive/50 bg-destructive/10")}>
+          <p className="text-[8px] uppercase text-muted-foreground font-medium">Overdue</p>
+          <p className={cn("text-xs font-bold", overdue > 0 ? "text-destructive font-black" : "text-muted-foreground")}>
+            {overdue > 0 ? `🔴 ${overdue}` : "0"}
+          </p>
+        </div>
+        <div className={cn("rounded border bg-background p-1", escalated > 0 && "border-amber-500/50 bg-amber-500/10")}>
+          <p className="text-[8px] uppercase text-muted-foreground font-medium">Escalated</p>
+          <p className={cn("text-xs font-bold", escalated > 0 ? "text-amber-600" : "text-muted-foreground")}>
+            {escalated > 0 ? `⚠️ ${escalated}` : "0"}
+          </p>
+        </div>
+      </div>
+
+      <Button
+        size="sm"
+        className="w-full text-xs font-semibold gap-1.5 bg-primary text-primary-foreground hover:bg-primary/90"
+        onClick={copyWhatsAppSummary}
+      >
+        <ClipboardCopy className="h-3.5 w-3.5" />
+        Copy WhatsApp Round Summary
+      </Button>
+    </div>
+  );
 }

@@ -1,0 +1,134 @@
+import { saveExecutionState, appendTimeline } from "@/e2eplus/persistence";
+import type { LeadExec, WhereOption } from "@/e2eplus/store";
+import type { Situation } from "@/e2eplus/journey";
+import { useAuditLog } from "@/lib/audit-log";
+import { logAction } from "@/lib/monitoring/activity-store";
+import { useIdentityStore } from "@/lib/lead-identity/store";
+import { canonicalCustomerId } from "@/lib/canonical/customer-id";
+
+export interface CarePersistencePayload {
+  leadId: string;
+  leadName: string;
+  phone?: string | null;
+  actor: { id: string; name: string };
+  outcomeCode: string;
+  outcomeLabel: string;
+  stage: string;
+  situation: Situation;
+  nextActionKind: string;
+  nextActionNote: string;
+  dueAt: string;
+  ownerId: string;
+  ownerName: string;
+  customerMessage: string;
+  internalWrapUp: string;
+  tourProperty?: string | null;
+}
+
+/**
+ * Authoritative persistence for Movement CARE execution:
+ * 1. Writes to Supabase e2e_lead_execution
+ * 2. Appends to Supabase e2e_lead_timeline
+ * 3. Logs to universal audit log (useAuditLog)
+ * 4. Logs to monitoring activity store (logAction)
+ * 5. Syncs to canonical lead-identity store
+ */
+export async function persistCareAction(payload: CarePersistencePayload): Promise<{ ok: boolean; error?: string }> {
+  const {
+    leadId,
+    leadName,
+    phone,
+    actor,
+    outcomeLabel,
+    situation,
+    nextActionKind,
+    nextActionNote,
+    dueAt,
+    ownerId,
+    ownerName,
+    tourProperty,
+  } = payload;
+
+  const canonicalId = phone ? canonicalCustomerId({ phone, name: leadName }) : leadId;
+  const targetId = canonicalId || leadId;
+
+  // 1. Audit Log (universal audit entry)
+  useAuditLog.getState().log({
+    actorId: actor.id,
+    actorName: actor.name,
+    entityType: "lead",
+    entityId: targetId,
+    action: "movement-care-outcome",
+    summary: `${outcomeLabel} · Next: ${nextActionKind} by ${new Date(dueAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })} · Owner: ${ownerName}`,
+    after: {
+      outcome: outcomeLabel,
+      owner: ownerName,
+      deadline: dueAt,
+      nextAction: nextActionKind,
+      property: tourProperty,
+    },
+  });
+
+  // 2. Monitoring Action Log
+  logAction({
+    userId: actor.id,
+    userName: actor.name,
+    leadId: targetId,
+    leadName,
+    action: "movement-care-outcome",
+    feature: "one-tap-care",
+    stageTo: situation,
+    remarks: `${outcomeLabel} | ${nextActionNote}`,
+  });
+
+  // 3. Identity store sync (timeline activity)
+  try {
+    const identityStore = useIdentityStore.getState();
+    const existing = identityStore.leads.find((l) => l.ulid === targetId || l.ulid === leadId);
+    if (existing) {
+      identityStore.logActivity(
+        existing.ulid,
+        "state-changed",
+        `[Movement CARE] ${outcomeLabel} (Owner: ${ownerName}, Next: ${nextActionKind} due ${new Date(dueAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })})`,
+        { outcome: outcomeLabel, nextActionKind, dueAt, ownerName, tourProperty }
+      );
+    }
+  } catch (err) {
+    console.warn("Identity store timeline sync error:", err);
+  }
+
+  // 4. Hosted Supabase backend sync (e2e_lead_execution + e2e_lead_timeline)
+  try {
+    const exec: LeadExec = {
+      leadId: targetId,
+      where: "Active WhatsApp Chat" as WhereOption,
+      channel: "WhatsApp",
+      when: "TODAY",
+      followUpAt: dueAt,
+      ownerId,
+      ownerName,
+      claimedAt: new Date().toISOString(),
+      ownershipMode: "OWNED",
+      urgency: "IMMEDIATE",
+      probability: "HIGH",
+      situation,
+      nextAction: nextActionKind,
+      nextActionAt: dueAt,
+      lastOutcome: outcomeLabel,
+      timeline: [],
+    };
+
+    await saveExecutionState(exec);
+    await appendTimeline(
+      targetId,
+      actor.name || "Operator",
+      `Movement CARE One-Tap: ${outcomeLabel} (Next: ${nextActionKind} due ${new Date(dueAt).toLocaleTimeString("en-IN")})`
+    );
+
+    return { ok: true };
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error("Supabase hosted backend sync error:", errorMsg);
+    return { ok: false, error: errorMsg };
+  }
+}
