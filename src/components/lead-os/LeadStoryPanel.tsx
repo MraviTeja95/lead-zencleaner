@@ -20,6 +20,13 @@ import {
   type LibraryRow,
 } from "@/lib/lead-os/library";
 import { buildApproach, computeSla, humanAge, screenshotHeartbeat } from "@/lib/lead-os/sla";
+import { QUICK_PRESETS, type QuickPreset } from "@/lib/pipeline/dossier-presets";
+import { usePipeline } from "@/lib/pipeline/store";
+import { useApp } from "@/lib/store";
+import { useMovement } from "@/movement/store";
+import { canonicalCustomerId } from "@/lib/canonical/customer-id";
+import { useIdentityStore } from "@/lib/lead-identity/store";
+import { cn } from "@/lib/utils";
 
 const TONE: Record<string, string> = {
   ok: "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
@@ -111,53 +118,113 @@ export function LeadStoryPanel({
 
   const visible = showAll ? ordered : ordered.slice(-12);
 
-  // ── 1-Click Qualify helpers ────────────────────────────────────────────────
-  const qualifyPresets = [
-    {
-      label: "HSR · 15k · Immediate",
-      message: `Hi ${name || "there"}, confirming your qualification:\n• Area: HSR Layout\n• Budget: ₹15,000/mo\n• Move-in: Immediate\n\nWe'll share matching options shortly. 🏠`,
-    },
-    {
-      label: "BTM · 10k · Shared",
-      message: `Hi ${name || "there"}, confirming your qualification:\n• Area: BTM Layout\n• Budget: ₹10,000/mo\n• Move-in: Flexible (shared preferred)\n\nWe'll share matching options shortly. 🏠`,
-    },
-  ] as const;
+  // ── One-Tap Qualification Presets ──────────────────────────────────────────
+  const [activePresetId, setActivePresetId] = useState<string | null>(null);
+  const user = useIdentityStore((s) => s.currentUser);
 
   async function handlePresetClick(
     e: React.MouseEvent<HTMLButtonElement>,
-    preset: { label: string; message: string },
+    preset: QuickPreset,
   ) {
     e.preventDefault();
-    console.log("Preset clicked:", preset);
+    setActivePresetId(preset.id);
+    console.log("Preset clicked:", preset.id, preset.label);
+
+    // 1. Update pipeline dossier
+    usePipeline.getState().applyDossierPreset(leadId, preset.patch, {
+      userId: user.id,
+      userName: user.name,
+    });
+
+    // 2. Sync to CRM lead in useApp
+    const app = useApp.getState();
+    const crmLead = app.leads.find((l) => l.id === leadId);
+    if (crmLead) {
+      app.patchLead(leadId, {
+        moveInDate: preset.patch.moveDate ?? crmLead.moveInDate,
+        budget: preset.patch.budget ?? crmLead.budget,
+        preferredArea: preset.patch.area ?? crmLead.preferredArea,
+      });
+      if (preset.patch.signals) {
+        preset.patch.signals.forEach((sig) => app.addLeadTag(leadId, sig));
+      }
+    }
+
+    // 3. Sync to Movement OS
+    const mv = useMovement.getState();
+    const cid = crmLead ? canonicalCustomerId({ phone: crmLead.phone, name: crmLead.name }) : leadId;
+    const mvLead = Object.values(mv.states).find((s) => s.canonicalId === cid || s.canonicalId === leadId || s.ulid === leadId);
+    if (mvLead) {
+      mv.capture(mvLead.ulid, {
+        moveInDate: preset.patch.moveDate ?? undefined,
+        budget: preset.patch.budget ?? undefined,
+        location: preset.patch.area ?? undefined,
+      });
+      mv.log(mvLead.ulid, "note", `Applied One-Tap Preset: ${preset.label}`);
+    }
+
+    // 4. Persist to hosted backend (e2e_lead_execution + e2e_lead_timeline)
     try {
-      await navigator.clipboard.writeText(preset.message);
-      toast.success(`Qualified as "${preset.label}" — message copied to clipboard`);
+      const { saveExecutionState, appendTimeline } = await import("@/e2eplus/persistence");
+      await saveExecutionState({
+        leadId,
+        situation: "QUALIFYING",
+        where: "CRM Lead Exists",
+        verified: { moveDate: true, budget: true },
+        timeline: [],
+      });
+      await appendTimeline(leadId, user.name || "Operator", `Applied One-Tap Preset: ${preset.label}`);
+    } catch (err) {
+      console.warn("Hosted backend sync for preset:", err);
+    }
+
+    // 5. Pre-format customer WhatsApp message & copy to clipboard
+    const customerName = name || crmLead?.name || "there";
+    const moveInText = preset.patch.moveDate ? `\n• Move-in: ${preset.patch.moveDate}` : "";
+    const personaText = preset.patch.leadPersona ? `\n• Type: ${preset.patch.leadPersona}` : "";
+    const msg = `Hi ${customerName}, confirming your qualification:\n• Requirement: ${preset.label}${personaText}${moveInText}\n\nWe are sharing tailored options for you shortly! 🏠`;
+
+    try {
+      await navigator.clipboard.writeText(msg);
+      toast.success(`Preset "${preset.label}" applied & WhatsApp update copied!`);
     } catch (err) {
       console.error("Clipboard write failed:", err);
-      toast.error("Could not copy to clipboard — please copy manually.");
+      toast.success(`Preset "${preset.label}" applied!`);
     }
   }
 
   return (
     <div className="space-y-3">
       {/* ── 1-Click Qualification Preset Bar ─────────────────────────── */}
-      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2">
-        <span className="flex shrink-0 items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400">
+      <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 space-y-1.5">
+        <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400">
           <Sparkles className="h-4 w-4 text-amber-600" />
-          ⚡ 1-Click Qualify Presets:
-        </span>
-        {qualifyPresets.map((preset) => (
-          <Button
-            key={preset.label}
-            type="button"
-            size="sm"
-            variant="outline"
-            className="h-7 border-amber-500/50 text-xs hover:bg-amber-500/10 hover:text-amber-700"
-            onClick={(e) => { void handlePresetClick(e, preset); }}
-          >
-            {preset.label}
-          </Button>
-        ))}
+          <span>⚡ One-Tap Presets (1-Click Qualify & Copy):</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {QUICK_PRESETS.slice(0, 8).map((preset) => {
+            const isSelected = activePresetId === preset.id;
+            return (
+              <Button
+                key={preset.id}
+                type="button"
+                size="sm"
+                variant={isSelected ? "default" : "outline"}
+                className={cn(
+                  "h-7 text-xs transition cursor-pointer gap-1",
+                  isSelected
+                    ? "bg-amber-600 text-white font-bold border-amber-600 shadow-sm"
+                    : "border-amber-500/50 hover:bg-amber-500/10 hover:text-amber-800 dark:hover:text-amber-300"
+                )}
+                onClick={(e) => { void handlePresetClick(e, preset); }}
+              >
+                <span>{preset.emoji}</span>
+                <span>{preset.label}</span>
+                {isSelected && <span className="ml-0.5 font-bold">✓</span>}
+              </Button>
+            );
+          })}
+        </div>
       </div>
       {/* ────────────────────────────────────────────────────────────── */}
 

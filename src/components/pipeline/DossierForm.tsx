@@ -24,6 +24,11 @@ import {
 } from "@/lib/pipeline/dossier-presets";
 import { WhyCaption, WhySectionBanner } from "@/components/common/WhyCaption";
 import { LifecyclePanel } from "@/components/pipeline/LifecyclePanel";
+import { toast } from "sonner";
+import { useApp } from "@/lib/store";
+import { useMovement } from "@/movement/store";
+import { canonicalCustomerId } from "@/lib/canonical/customer-id";
+import type { QuickPreset } from "@/lib/pipeline/dossier-presets";
 
 interface Props { leadId: string; }
 
@@ -59,18 +64,89 @@ export function DossierForm({ leadId }: Props) {
     patch({ signals: cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s] });
   };
   const [presetFilter, setPresetFilter] = useState("");
+  const [activePresetId, setActivePresetId] = useState<string | null>(null);
   const filteredPresets = QUICK_PRESETS.filter((p) =>
     !presetFilter || p.label.toLowerCase().includes(presetFilter.toLowerCase()),
   );
 
-  /** True when every field in the preset patch already matches the current dossier. */
-  const isPresetActive = (patch: Partial<typeof dossier>) =>
-    (Object.keys(patch) as (keyof typeof dossier)[]).every((k) => {
-      const pv = patch[k];
-      const dv = dossier[k];
-      if (Array.isArray(pv)) return (Array.isArray(dv) ? dv : []).join(",") === (pv as string[]).join(",");
-      return dv === pv;
-    });
+  /** True when clicked directly or when preset fields match the current dossier state. */
+  const isPresetActive = (p: QuickPreset) => {
+    if (activePresetId === p.id) return true;
+    const patch = p.patch;
+    const nonArrayKeys = (Object.keys(patch) as (keyof typeof dossier)[]).filter(
+      (k) => k !== "signals" && !Array.isArray(patch[k])
+    );
+    const nonArraysMatch = nonArrayKeys.every((k) => dossier[k] === patch[k]);
+    if (!nonArraysMatch) return false;
+    if (patch.signals && patch.signals.length > 0) {
+      const curSignals = dossier.signals ?? [];
+      return patch.signals.every((s) => curSignals.includes(s));
+    }
+    return true;
+  };
+
+  const handleApplyPreset = async (p: QuickPreset) => {
+    setActivePresetId(p.id);
+    console.log("Applying preset:", p.id, p.label);
+
+    // 1. Update pipeline dossier store
+    applyPreset(leadId, p.patch, { userId: user.id, userName: user.name });
+
+    // 2. Sync to CRM lead in useApp
+    const app = useApp.getState();
+    const crmLead = app.leads.find((l) => l.id === leadId);
+    if (crmLead) {
+      app.patchLead(leadId, {
+        moveInDate: p.patch.moveDate ?? crmLead.moveInDate,
+        budget: p.patch.budget ?? crmLead.budget,
+        preferredArea: p.patch.area ?? crmLead.preferredArea,
+      });
+      if (p.patch.signals) {
+        p.patch.signals.forEach((sig) => app.addLeadTag(leadId, sig));
+      }
+    }
+
+    // 3. Sync to Movement OS
+    const mv = useMovement.getState();
+    const cid = crmLead ? canonicalCustomerId({ phone: crmLead.phone, name: crmLead.name }) : leadId;
+    const mvLead = Object.values(mv.states).find((s) => s.canonicalId === cid || s.canonicalId === leadId || s.ulid === leadId);
+    if (mvLead) {
+      mv.capture(mvLead.ulid, {
+        moveInDate: p.patch.moveDate ?? undefined,
+        budget: p.patch.budget ?? undefined,
+        location: p.patch.area ?? undefined,
+      });
+      mv.log(mvLead.ulid, "note", `Applied One-Tap Preset: ${p.label}`);
+    }
+
+    // 4. Persist to hosted backend (e2e_lead_execution + e2e_lead_timeline)
+    try {
+      const { saveExecutionState, appendTimeline } = await import("@/e2eplus/persistence");
+      await saveExecutionState({
+        leadId,
+        situation: "QUALIFYING",
+        where: "CRM Lead Exists",
+        verified: { moveDate: true, budget: true },
+        timeline: [],
+      });
+      await appendTimeline(leadId, user.name || "Operator", `Applied One-Tap Preset: ${p.label}`);
+    } catch (err) {
+      console.warn("Hosted backend sync for preset:", err);
+    }
+
+    // 5. Pre-format customer WhatsApp confirmation message
+    const customerName = crmLead?.name ?? mvLead?.name ?? "there";
+    const moveInText = p.patch.moveDate ? `\n• Move-in: ${p.patch.moveDate}` : "";
+    const personaText = p.patch.leadPersona ? `\n• Type: ${p.patch.leadPersona}` : "";
+    const msg = `Hi ${customerName}, confirming your qualification:\n• Requirement: ${p.label}${personaText}${moveInText}\n\nWe are sharing tailored options for you shortly! 🏠`;
+
+    try {
+      await navigator.clipboard.writeText(msg);
+      toast.success(`Preset "${p.label}" applied & WhatsApp update copied!`);
+    } catch {
+      toast.success(`Preset "${p.label}" applied!`);
+    }
+  };
 
   return (
     <div className="space-y-4">
@@ -95,26 +171,22 @@ export function DossierForm({ leadId }: Props) {
         />
         <div className="flex flex-wrap gap-1">
           {filteredPresets.map((p) => {
-            const active = isPresetActive(p.patch);
+            const active = isPresetActive(p);
             return (
               <button
                 key={p.id}
                 type="button"
                 title={p.hint}
-                onPointerDown={() => console.log("PRESET POINTER DOWN", p.id)}
-                onClick={() => {
-                  console.log("PRESET CLICK", p.id);
-                  applyPreset(leadId, p.patch, { userId: user.id, userName: user.name });
-                }}
+                onClick={() => { void handleApplyPreset(p); }}
                 className={cn(
-                  "text-[11px] px-2 py-1 rounded-md border transition inline-flex items-center gap-1",
+                  "text-[11px] px-2.5 py-1 rounded-md border transition inline-flex items-center gap-1 cursor-pointer",
                   active
-                    ? "border-primary bg-primary/15 text-primary font-semibold"
+                    ? "border-primary bg-primary/20 text-primary font-bold shadow-sm ring-1 ring-primary/40"
                     : "border-border bg-background text-foreground hover:bg-primary/10 hover:border-primary/40",
                 )}
               >
                 <span>{p.emoji}</span>{p.label}
-                {active && <span className="text-[9px] ml-0.5 opacity-70">✓</span>}
+                {active && <span className="text-[10px] ml-1 font-bold text-primary">✓</span>}
               </button>
             );
           })}
