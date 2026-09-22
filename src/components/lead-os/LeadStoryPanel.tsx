@@ -123,24 +123,25 @@ export function LeadStoryPanel({
     },
   ] as const;
 
-  function handlePresetClick(
+  async function handlePresetClick(
     e: React.MouseEvent<HTMLButtonElement>,
     preset: { label: string; message: string },
   ) {
     e.preventDefault();
-    e.stopPropagation();
     console.log("Preset clicked:", preset);
-    void navigator.clipboard.writeText(preset.message);
-    toast.success(`Qualified as "${preset.label}" — message copied to clipboard`);
+    try {
+      await navigator.clipboard.writeText(preset.message);
+      toast.success(`Qualified as "${preset.label}" — message copied to clipboard`);
+    } catch (err) {
+      console.error("Clipboard write failed:", err);
+      toast.error("Could not copy to clipboard — please copy manually.");
+    }
   }
 
   return (
     <div className="space-y-3">
       {/* ── 1-Click Qualification Preset Bar ─────────────────────────── */}
-      <div
-        className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2"
-        style={{ position: "relative", zIndex: 10, pointerEvents: "auto" }}
-      >
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2">
         <span className="flex shrink-0 items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400">
           <Sparkles className="h-4 w-4 text-amber-600" />
           ⚡ 1-Click Qualify Presets:
@@ -152,8 +153,7 @@ export function LeadStoryPanel({
             size="sm"
             variant="outline"
             className="h-7 border-amber-500/50 text-xs hover:bg-amber-500/10 hover:text-amber-700"
-            style={{ pointerEvents: "auto" }}
-            onClick={(e) => handlePresetClick(e, preset)}
+            onClick={(e) => { void handlePresetClick(e, preset); }}
           >
             {preset.label}
           </Button>
@@ -222,9 +222,15 @@ export function LeadStoryPanel({
               <MessageSquare className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <span className="flex-1">{approach.message}</span>
               <Button
+                type="button"
                 size="sm"
                 variant="ghost"
-                onClick={() => { void navigator.clipboard.writeText(approach.message); toast.success("Message copied"); }}
+                onClick={() => {
+                  navigator.clipboard.writeText(approach.message).then(
+                    () => toast.success("Message copied"),
+                    () => toast.error("Could not copy — please copy manually."),
+                  );
+                }}
               >
                 <Copy className="h-3.5 w-3.5" />
               </Button>
