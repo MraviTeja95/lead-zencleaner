@@ -58,11 +58,19 @@ export function DossierForm({ leadId }: Props) {
     const cur = dossier.signals ?? [];
     patch({ signals: cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s] });
   };
-
   const [presetFilter, setPresetFilter] = useState("");
   const filteredPresets = QUICK_PRESETS.filter((p) =>
     !presetFilter || p.label.toLowerCase().includes(presetFilter.toLowerCase()),
   );
+
+  /** True when every field in the preset patch already matches the current dossier. */
+  const isPresetActive = (patch: Partial<typeof dossier>) =>
+    (Object.keys(patch) as (keyof typeof dossier)[]).every((k) => {
+      const pv = patch[k];
+      const dv = dossier[k];
+      if (Array.isArray(pv)) return (Array.isArray(dv) ? dv : []).join(",") === (pv as string[]).join(",");
+      return dv === pv;
+    });
 
   return (
     <div className="space-y-4">
@@ -70,7 +78,7 @@ export function DossierForm({ leadId }: Props) {
       <div className="rounded-lg border border-dashed border-primary/30 bg-primary/5 p-2.5 space-y-1.5">
         <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-primary font-semibold">
           <Zap className="h-3 w-3" /> One-tap presets
-          <span className="text-muted-foreground/70 normal-case font-normal">· merges with what you've filled</span>
+          <span className="text-muted-foreground/70 normal-case font-normal">· merges with what you’ve filled</span>
           <Input
             className="h-6 ml-auto w-32 text-[11px]"
             placeholder="Filter presets…"
@@ -86,17 +94,31 @@ export function DossierForm({ leadId }: Props) {
           client="Faster first response — right script from message #1."
         />
         <div className="flex flex-wrap gap-1">
-          {filteredPresets.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              title={p.hint}
-              onClick={() => applyPreset(leadId, p.patch, { userId: user.id, userName: user.name })}
-              className="text-[11px] px-2 py-1 rounded-md border border-border bg-background hover:bg-primary/10 hover:border-primary/40 transition inline-flex items-center gap-1"
-            >
-              <span>{p.emoji}</span>{p.label}
-            </button>
-          ))}
+          {filteredPresets.map((p) => {
+            const active = isPresetActive(p.patch);
+            return (
+              <button
+                key={p.id}
+                type="button"
+                title={p.hint}
+                onPointerDown={() => console.log("PRESET POINTER DOWN", p.id)}
+                onClick={() => {
+                  console.log("PRESET CLICK", p.id);
+                  applyPreset(leadId, p.patch, { userId: user.id, userName: user.name });
+                }}
+                className={cn(
+                  "text-[11px] px-2 py-1 rounded-md border transition inline-flex items-center gap-1",
+                  active
+                    ? "border-primary bg-primary/15 text-primary font-semibold"
+                    : "border-border bg-background text-foreground hover:bg-primary/10 hover:border-primary/40",
+                )}
+              >
+                <span>{p.emoji}</span>{p.label}
+                {active && <span className="text-[9px] ml-0.5 opacity-70">✓</span>}
+              </button>
+            );
+          })}
+
           {filteredPresets.length === 0 && (
             <span className="text-[10px] text-muted-foreground">No preset matches "{presetFilter}"</span>
           )}
